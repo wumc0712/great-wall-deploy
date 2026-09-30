@@ -1,0 +1,57 @@
+{
+  "log": {
+    "loglevel": "%%LOG_LEVEL%%",
+    "access": "%%LOG_ACCESS%%",
+    "error": "%%LOG_ERROR%%"
+  },
+  "inbounds": [
+    {
+      "tag": "ws-in",
+      "listen": "0.0.0.0",
+      "port": %%PORT%%,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "%%UUID%%",
+            "email": "%%EMAIL%%",
+            "flow": ""
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "none",
+        "wsSettings": {
+          "path": "%%WS_PATH%%",
+          "host": "%%WS_HOST%%"
+        }
+      },
+      "sniffing": {
+        "enabled": %%SNIFFING%%,
+        "destOverride": [ "http", "tls" ]
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "direct",
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "%%DOMAIN_STRATEGY%%"
+      }
+    },
+    {
+      "tag": "drop",
+      "protocol": "blackhole",
+      "settings": {}
+    }
+  ],
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+%%ROUTING_RULES%%
+    ]
+  }
+}

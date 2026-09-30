@@ -1,0 +1,65 @@
+# 边缘反代：终止 TLS（Let's Encrypt 自动签发/续期），并隐藏后端的存在。
+#
+# 伪装策略：只有「路径 + WS 升级头」同时匹配的请求才转发给后端容器，
+# 其余一切请求都返回普通静态站点。因此主动探测看到的是个正常小站，
+# 拿不到「404 + 服务端头缺失」这类代理指纹。
+#
+# 由 compose 注入的变量：
+#   APP_DOMAIN     对外域名，同时用于申请证书
+#   APP_WS_PATH    WebSocket 路径，须与容器内服务一致
+#   APP_UPSTREAM   后端地址，形如 app:10000（compose 里由 APP_PORT 拼好）
+#   ACME_EMAIL     Let's Encrypt 通知邮箱，可留空
+#
+# 关于邮箱：这里不写 email 指令。Caddy 的 email 指令要求必须带参数，
+# 而 ACME_EMAIL 默认为空、展开后会导致 Caddyfile 解析失败。留空时
+# Caddy 会注册无邮箱账号，功能不受影响；需要邮箱时请显式解开下面这行。
+#   { email you@example.com }
+
+{$APP_DOMAIN} {
+	encode zstd gzip
+
+	# --- WebSocket 入口：路径 + 升级头同时匹配才放行 -------------------------
+	# 普通 GET（含探测器的 GET）没有 Upgrade 头，会落到下面的静态页分支。
+	@ws {
+		path {$APP_WS_PATH}
+		header Connection *Upgrade*
+		header Upgrade *
+	}
+
+	handle @ws {
+		reverse_proxy {$APP_UPSTREAM}
+	}
+
+	# --- 伪装静态页：其余所有请求 -------------------------------------------
+	handle {
+		root * /srv/www
+		# 支持无扩展名访问（/about → about.html）。不加 /index.html 兜底：
+		# 不存在的路径应当返回 404 页，而不是 SPA 式地一律 200。
+		try_files {path} {path}.html {path}/
+		file_server
+	}
+
+	# 错误也返回站点自己的页面，而不是 Caddy 的默认纯文本。
+	# 只拦 404，其他错误保持原状。
+	handle_errors {
+		@notfound expression {err.status_code} == 404
+		handle @notfound {
+			rewrite * /404.html
+			root * /srv/www
+			file_server
+		}
+	}
+
+	# 去指纹：去掉 Caddy 的 Server 头，补上静态站该有的安全头。
+	header {
+		-Server
+		-X-Powered-By
+		Referrer-Policy "strict-origin-when-cross-origin"
+		X-Content-Type-Options "nosniff"
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

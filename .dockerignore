@@ -1,0 +1,15 @@
+# 构建上下文里不需要进镜像的东西
+#
+# 注意：caddy/ 与 web/ 只在运行时被 compose 挂载（宿主机路径），
+# 不参与 app 镜像构建，因此可以排除以缩小构建上下文。
+.git
+.gitignore
+.env
+.env.example
+docker-compose.yml
+README.md
+data/
+docs/
+caddy/
+web/
+*.log

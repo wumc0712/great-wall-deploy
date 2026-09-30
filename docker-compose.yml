@@ -1,0 +1,106 @@
+# 说明：两个容器，前线终止 TLS，后端只在内网提供明文 WS。
+#
+#   edge (caddy)  监听 80/443，自动申请 Let's Encrypt 证书；根路径与普通请求
+#                 返回静态站点，只有「路径 + WS 升级头」匹配时才转发给后端。
+#   后端           只在内网监听明文 WS，不映射端口到公网。
+#
+# 效果：1) 明文 WS 不再暴露，公网扫不到；
+#       2) 主动探测看到一个正常的静态站点，拿不到代理指纹。
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        SRC_VERSION: ${SRC_VERSION:-v5.41.0}
+        APP_BIN_NAME: ${APP_BIN_NAME:-relay}
+    image: ${APP_IMAGE:-relay}:${SRC_VERSION:-v5.41.0}
+    container_name: ${APP_CONTAINER_NAME:-relay}
+    restart: unless-stopped
+    # 变量经 compose 从同目录 .env 读取（cp .env.example .env 后修改）。
+    # 不用 env_file，避免 .env 缺失时 compose 直接报错。
+    environment:
+      APP_PORT: ${APP_PORT:-10000}
+      APP_WS_PATH: ${APP_WS_PATH:-/vless-ws}
+      APP_UUID: ${APP_UUID:-}
+      APP_WS_HOST: ${APP_WS_HOST:-}
+      APP_EMAIL: ${APP_EMAIL:-app}
+      APP_DOMAIN: ${APP_DOMAIN:-}
+      APP_SHARE_HOST: ${APP_SHARE_HOST:-}
+      APP_SHARE_PORT: ${APP_SHARE_PORT:-443}
+      APP_LOG_LEVEL: ${APP_LOG_LEVEL:-warning}
+      APP_LOG_ACCESS: ${APP_LOG_ACCESS:-}
+      APP_LOG_ERROR: ${APP_LOG_ERROR:-}
+      APP_SNIFFING: ${APP_SNIFFING:-true}
+      APP_DOMAIN_STRATEGY: ${APP_DOMAIN_STRATEGY:-UseIP}
+      APP_BLOCK_PRIVATE: ${APP_BLOCK_PRIVATE:-true}
+      APP_CLI: ${APP_CLI:-auto}
+    # 不映射端口：只在内网被 edge 访问，公网无法直接扫到明文 WS。
+    expose:
+      - "${APP_PORT:-10000}"
+    volumes:
+      # UUID 持久化：不设 APP_UUID 时，重启后 UUID 保持不变。
+      - ./data:/etc/app
+    read_only: true
+    tmpfs:
+      - /run
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      # 明文 WS 端口对未经升级的 HTTP 请求返回 404，据此判断进程在监听。
+      test: ["CMD-SHELL", "wget -q -S -O /dev/null http://127.0.0.1:${APP_PORT:-10000}/ 2>&1 | grep -q 'HTTP/'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  edge:
+    image: caddy:2.8-alpine
+    container_name: ${EDGE_CONTAINER_NAME:-front}
+    restart: unless-stopped
+    depends_on:
+      - app
+    environment:
+      # 必填：对外域名。缺省时退化为只在 80 端口服务（无证书），便于本机验证。
+      APP_DOMAIN: ${APP_DOMAIN:-:80}
+      APP_WS_PATH: ${APP_WS_PATH:-/vless-ws}
+      # Caddyfile 里直接用的后端地址与独立变量（避免在 token 内嵌变量）。
+      APP_UPSTREAM: app:${APP_PORT:-10000}
+      APP_PORT: ${APP_PORT:-10000}
+      ACME_EMAIL: ${ACME_EMAIL:-}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./web:/srv/www:ro
+      # 证书与 ACME 账号必须持久化，否则每次重启都重新申请（有速率限制）。
+      - caddy_data:/data
+      - caddy_config:/config
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    cap_add:
+      # 绑定 80/443（非 root 用户）需要
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  caddy_data:
+  caddy_config:
