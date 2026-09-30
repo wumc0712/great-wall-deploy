@@ -75,6 +75,53 @@ case "$APP_PORT" in
 esac
 [ "$APP_PORT" -ge 1 ] && [ "$APP_PORT" -le 65535 ] || die "APP_PORT 超出 1-65535：$APP_PORT"
 
+# ------------------------------------------------------------ 入口层 ---------
+# 托管平台（Railway 等）只有一个对外端口，跑不了 compose 里的 edge 容器，
+# 于是静态站点伪装会整个丢失——探测者直连后端会看到 400/404。这里在**同一容器内**
+# 起一个 Caddy 做入口层：对外提供静态站点，只把「路径 + WS 升级头」转发给后端。
+#
+# 开关：auto（默认）——检测到平台注入的端口就启用；true/false 可强制。
+# 端口：APP_EDGE_PORT 显式指定，否则用平台注入的 PORT。两个端口必须不同。
+APP_EDGE="${APP_EDGE:-auto}"
+case "$APP_EDGE" in
+    auto)
+        if [ -n "${APP_EDGE_PORT:-}" ] || [ -n "${PORT:-}" ]; then APP_EDGE_ON=true; else APP_EDGE_ON=false; fi
+        ;;
+    true|false) APP_EDGE_ON="$APP_EDGE" ;;
+    *) die "APP_EDGE 只能是 auto/true/false：$APP_EDGE" ;;
+esac
+
+APP_EDGE_PORT="${APP_EDGE_PORT:-${PORT:-}}"
+if [ "$APP_EDGE_ON" = "true" ]; then
+    if [ -z "$APP_EDGE_PORT" ]; then
+        # 明确要求启用却拿不到对外端口：与其静默降级（正是要修的 bug），不如直接报错。
+        die "APP_EDGE=true 但拿不到对外端口：请设置 APP_EDGE_PORT（或让平台注入 PORT）"
+    fi
+    case "$APP_EDGE_PORT" in
+        ''|*[!0-9]*) die "APP_EDGE_PORT 必须为数字：$APP_EDGE_PORT" ;;
+    esac
+    [ "$APP_EDGE_PORT" -ge 1 ] && [ "$APP_EDGE_PORT" -le 65535 ] \
+        || die "APP_EDGE_PORT 超出 1-65535：$APP_EDGE_PORT"
+    if [ "$APP_EDGE_PORT" = "$APP_PORT" ]; then
+        die "端口冲突：APP_PORT 与 APP_EDGE_PORT 同为 $APP_PORT。入口层与后端必须用不同端口，请显式设置其中一个"
+    fi
+fi
+
+# 入口层开启时后端只绑回环：公网扫不到明文 WS，平台也只能看到入口层那一个端口。
+if [ "$APP_EDGE_ON" = "true" ]; then
+    APP_LISTEN_ADDR="${APP_LISTEN_ADDR:-127.0.0.1}"
+else
+    APP_LISTEN_ADDR="${APP_LISTEN_ADDR:-0.0.0.0}"
+fi
+# 入口层反代目标固定走回环，不依赖 APP_LISTEN_ADDR（它可能有别的用途）。
+APP_UPSTREAM="${APP_UPSTREAM:-127.0.0.1:${APP_PORT}}"
+APP_EDGE_BIN="${APP_EDGE_BIN:-/usr/sbin/caddy}"
+APP_EDGE_CONF="${APP_EDGE_CONF:-/usr/local/share/app/Caddyfile.platform}"
+APP_WWW="${APP_WWW:-/srv/www}"
+
+no_percent APP_LISTEN_ADDR "$APP_LISTEN_ADDR"
+no_percent APP_UPSTREAM "$APP_UPSTREAM"
+
 APP_WS_PATH="${APP_WS_PATH:-/vless-ws}"
 case "$APP_WS_PATH" in
     /*) ;;
@@ -179,6 +226,7 @@ sed \
     -e "s|%%UUID%%|$(escape "$APP_UUID")|g" \
     -e "s|%%EMAIL%%|$(escape "$APP_EMAIL")|g" \
     -e "s|%%PORT%%|$(escape "$APP_PORT")|g" \
+    -e "s|%%LISTEN_ADDR%%|$(escape "$APP_LISTEN_ADDR")|g" \
     -e "s|%%WS_PATH%%|$(escape "$APP_WS_PATH")|g" \
     -e "s|%%WS_HOST%%|$(escape "$APP_WS_HOST")|g" \
     -e "s|%%SNIFFING%%|$(escape "$APP_SNIFFING")|g" \
@@ -345,5 +393,69 @@ fi
 # geo 数据目录：二进制自身读取的变量名（不可更改），因此必须显式导出。
 export V2RAY_LOCATION_ASSET="$APP_ASSET_DIR"
 
-log "启动服务：version=$BUILT_VERSION uuid=$APP_UUID port=$APP_PORT path=$APP_WS_PATH host=${APP_WS_HOST:-<任意>}"
-exec "$APP_BIN" "$@"
+# ------------------------------------------------------------ 启动服务 -----
+# 未启用入口层：保持原有行为，直接 exec 后端（PID 1 就是服务本身）。
+if [ "$APP_EDGE_ON" != "true" ]; then
+    log "启动服务：version=$BUILT_VERSION uuid=$APP_UUID port=$APP_PORT path=$APP_WS_PATH host=${APP_WS_HOST:-<任意>}"
+    exec "$APP_BIN" "$@"
+fi
+
+# -------------------------------------------------------- 入口层 + 后端 ----
+# 两个进程同处一个容器：Caddy 对外，后端只监听回环。任一退出即整体退出
+# （避免"一个死了另一个还在"的半死状态），收到 TERM/INT 时转发给两者。
+[ -x "$APP_EDGE_BIN" ] || die "入口层已启用但找不到可执行文件：$APP_EDGE_BIN"
+[ -r "$APP_EDGE_CONF" ] || die "入口层配置不存在或不可读：$APP_EDGE_CONF"
+[ -d "$APP_WWW" ] || log "警告：静态站点目录不存在：$APP_WWW（探测者将看到 404）"
+
+# Caddy 用 {$VAR} 读环境变量，因此必须导出。
+export APP_EDGE_PORT APP_WS_PATH APP_UPSTREAM APP_WWW
+
+APP_EDGE_LOG="${APP_EDGE_LOG:-}"
+if [ -n "$APP_EDGE_LOG" ]; then
+    case "$APP_EDGE_LOG" in
+        /*) ;;
+        *) die "APP_EDGE_LOG 必须是绝对路径（或留空以输出到 stdout）：$APP_EDGE_LOG" ;;
+    esac
+    mkdir -p "$(dirname "$APP_EDGE_LOG")" || die "无法创建入口层日志目录：$(dirname "$APP_EDGE_LOG")"
+fi
+
+log "启动入口层：caddy 监听 :$APP_EDGE_PORT，静态站点=$APP_WWW，WS 路径=$APP_WS_PATH"
+log "启动服务：version=$BUILT_VERSION uuid=$APP_UUID port=$APP_PORT（仅 $APP_LISTEN_ADDR）path=$APP_WS_PATH host=${APP_WS_HOST:-<任意>}"
+
+PIDS=""
+start() {
+    if [ -n "$APP_EDGE_LOG" ]; then
+        "$@" >> "$APP_EDGE_LOG" 2>&1 &
+    else
+        "$@" &
+    fi
+    PIDS="$PIDS $!"
+}
+
+shutdown() {
+    # 先摘掉 trap，避免清理过程中再次触发。
+    trap - TERM INT EXIT
+    log "收到终止信号，正在停止..."
+    # shellcheck disable=SC2086
+    for p in $PIDS; do kill -TERM "$p" 2>/dev/null || true; done
+    for p in $PIDS; do wait "$p" 2>/dev/null || true; done
+    log "已停止"
+    exit 0
+}
+trap shutdown TERM INT
+
+start "$APP_EDGE_BIN" run --config "$APP_EDGE_CONF" --adapter caddyfile
+start "$APP_BIN" "$@"
+
+# 轮询等待任一进程退出（不用 wait -n：busybox ash 下拿不到是哪个进程、也取不到退出码）。
+while :; do
+    for p in $PIDS; do
+        if ! kill -0 "$p" 2>/dev/null; then
+            wait "$p" 2>/dev/null
+            rc=$?
+            log "进程 $p 退出（退出码 $rc），停止容器"
+            shutdown
+        fi
+    done
+    sleep 1
+done

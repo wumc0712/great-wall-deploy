@@ -36,6 +36,10 @@ services:
       APP_DOMAIN_STRATEGY: ${APP_DOMAIN_STRATEGY:-UseIP}
       APP_BLOCK_PRIVATE: ${APP_BLOCK_PRIVATE:-true}
       APP_CLI: ${APP_CLI:-auto}
+      # 关闭容器内嵌入口层：这里已有独立的 edge(Caddy) 承担 TLS 与静态站点伪装，
+      # 再开一层就变成 Caddy 套 Caddy。该功能是给「只有一个对外端口、跑不了
+      # edge 容器」的托管平台（如 Railway）用的，见 README。
+      APP_EDGE: ${APP_EDGE:-false}
     # 不映射端口：只在内网被 edge 访问，公网无法直接扫到明文 WS。
     expose:
       - "${APP_PORT:-10000}"

@@ -41,7 +41,8 @@
 ├── docker/
 │   ├── entrypoint.sh           渲染配置 + 校验环境变量 + 启动前生成分享链接
 │   ├── extract-artifacts.sh    在 builder 阶段定位并抽出发行产物
-│   └── debrand.sh              构建期对二进制做等长品牌字符串替换
+│   ├── debrand.sh              构建期对二进制做等长品牌字符串替换
+│   └── Caddyfile.platform      容器内嵌入口层配置（托管平台用，纯 HTTP）
 └── scripts/
     └── share-link.sh           生成 VLESS 分享链接；也会装进镜像供容器内调用
 ```
@@ -188,6 +189,8 @@ docker compose exec app cat /run/app/config.json
 | `APP_DOMAIN_STRATEGY` | `UseIP` | 出站解析策略 |
 | `APP_BLOCK_PRIVATE` | `true` | 丢弃目标为私网地址的出站流量，避免被当作内网跳板 |
 | `APP_CLI` | `auto` | 主版本探测；仅在自动识别异常时才需强制 `v4`/`v5` |
+| `APP_EDGE` | `auto` | 是否启用容器内嵌 Caddy 入口层（静态站点伪装 + 端口适配）。`auto` 时检测到平台注入端口即启用；compose 部署应保持 `false` |
+| `APP_EDGE_PORT` | 空 | 入口层对外监听端口，留空取平台注入的 `PORT`。必须与 `APP_PORT` 不同 |
 
 脚本会对 `APP_PORT`、`APP_WS_PATH`、`APP_UUID`、`APP_EMAIL`、`APP_LOG_LEVEL`、`APP_SNIFFING`、`APP_DOMAIN_STRATEGY`、`APP_BLOCK_PRIVATE`、`APP_WS_HOST`、`APP_CLI` 做校验，非法值会让容器直接以非零码退出并打印原因，而不是带着坏配置启动。其中 `APP_WS_PATH`、`APP_EMAIL`、`APP_WS_HOST` 只允许安全字符集，避免破坏生成的 JSON。
 
@@ -201,15 +204,24 @@ docker compose exec app cat /run/app/config.json
   无需设置 `APP_DOMAIN`。解析顺序为 `APP_SHARE_HOST` → `APP_DOMAIN` → `RAILWAY_PUBLIC_DOMAIN` → `APP_WS_HOST`，
   显式配置始终优先；平台值会被规整成纯主机名（去掉 `scheme://`、路径、端口），非法时只警告忽略、
   **绝不影响容器启动**。
-- **端口**：平台通常通过 `PORT` 决定对外端口，而本方案默认监听 `APP_PORT`（10000）。
-  若平台要求监听指定端口，请显式设置 `APP_PORT`（或 `PORT`，见下方注意）。
-- **`docker-compose.yml` 里的 `edge`（Caddy）不会启动**：Railway 一个服务只暴露一个端口，
-  跑不了需要 80/443 的 Caddy。此时 **TLS 由平台边缘终止**，所以分享链接里端口用 `443` 是对的，
-  但 README 前文描述的「静态站点伪装」和「明文 WS 不暴露」在平台上**不生效**——
-  探测者看到的是后端行为。要保留那层伪装，需要在支持多端口/自带域名的 VPS 上用 compose 部署。
+- **静态站点伪装会自动补回**：平台一个服务只暴露一个端口，跑不了 compose 里的 `edge` 容器。
+  为此本方案在**容器内**内置了一层 Caddy 入口层（镜像已装 `caddy`，静态站点 `web/` 已打进镜像）：
+  对外监听平台注入的 `PORT`，根路径等普通请求返回静态站点，只把「路径 + WS 升级头」转发给后端。
+  入口脚本检测到平台端口时**自动启用**（可用 `APP_EDGE=false` 关闭）。
+- **TLS 由平台边缘终止**：所以分享链接里端口用 `443` 是对的，容器内只跑明文 HTTP。
+- **端口**：入口层监听平台注入的 `PORT`，后端自动退到容器内部另一个端口（默认 `10000`，只绑回环）。
+  两者必须不同，冲突时会明确报错而不是静默降级。
 
-> 注意：本仓库的入口脚本目前只识别平台注入的域名，**不识别平台的 `PORT` 变量**。
-> 若平台上容器因端口不匹配而健康检查失败，请显式设置 `APP_PORT`。
+> 只有在「平台既不给 `PORT`、也不给 `APP_EDGE_PORT`」的情况下入口层才不启用。此时可显式设置
+> `APP_EDGE_PORT`（或 `APP_EDGE=true` 强制启用）；`APP_EDGE=true` 但拿不到端口会直接启动失败。
+
+### 端口分工
+
+| 场景 | 对外端口 | 后端监听 | 静态站点伪装 |
+| --- | --- | --- | --- |
+| compose（VPS） | `edge` 容器的 80/443 | `app` 容器 `APP_PORT`（内网） | 由 `edge` 的 Caddy 提供 |
+| 托管平台（Railway 等） | 平台注入的 `PORT` | 容器内回环 `APP_PORT`（公网扫不到） | 由**容器内嵌**的 Caddy 提供 |
+| 直接 `docker run`（未给平台端口） | `APP_PORT` | 同上 | 无（可用 `APP_EDGE_PORT` 显式开启） |
 
 ## v4 / v5 差异
 
@@ -276,6 +288,17 @@ curl -s -o /dev/null -w '%{http_code}\n' https://your.domain.com/nope
 > busybox 1.30 与 GNU sed 都与逐字节基准一致，唯独 1.37 不同且大小不变）；
 > alpine 的 busybox `grep` 也不适合直接查二进制——1.37 没有 `-z`，且会把 `NUL`
 > 当行分隔符导致漏报。脚本因此要求 GNU sed，并用 `tr '\0' '\n'` 归一化后再做存在性检查。
+
+容器内嵌入口层（`docker/Caddyfile.platform` + `entrypoint.sh` 的双进程监督）已用
+**真实 v2ray 二进制 + 真实 caddy 2.8.4** 端到端实测：
+
+- 启用入口层时：`/`、`/about`、`/assets/style.css` 等返回 **200 静态站点**；
+  `/vless-ws` 无升级头返回站点自己的 **404 页**（HTML），带升级头才转发后端；
+  经入口层完成 VLESS + WS 端到端代理，且后端此时只监听 `127.0.0.1`；
+- 不启用时（`APP_EDGE=false`）：行为与改造**前完全一致**，无回归；
+- 任一进程退出（如后端崩溃）容器会整体停止，不再出现"一个死了另一个还在"的半死状态；
+  收到 `TERM` 时两个子进程都被清理，无残留进程；
+- `APP_EDGE=true` 但拿不到端口、或入口层端口与 `APP_PORT` 相同时，启动即报错而不是静默降级。
 
 改造为「Caddy 伪装层 + 去特征化命名」后，以下已用 dash 与 busybox `sh` 模拟容器环境回归通过：
 

@@ -49,19 +49,28 @@ ENV APP_BIN="/usr/local/bin/${APP_BIN_NAME}" \
     APP_TEMPLATE="/usr/local/share/app/config.json.template" \
     APP_VERSION_FILE="/usr/local/share/app/.version" \
     APP_CONFIG="/run/app/config.json" \
-    APP_UUID_FILE="/etc/app/uuid"
+    APP_UUID_FILE="/etc/app/uuid" \
+    APP_EDGE_BIN="/usr/sbin/caddy" \
+    APP_EDGE_CONF="/usr/local/share/app/Caddyfile.platform" \
+    APP_WWW="/srv/www"
 
+# caddy 用作可选的入口层（托管平台上补回静态站点伪装与端口适配）。
+# 只在运行时镜像装，builder 阶段不需要。
 RUN set -eux; \
-    apk add --no-cache ca-certificates; \
-    mkdir -p "${APP_ASSET_DIR}" /run/app /etc/app
+    apk add --no-cache ca-certificates caddy; \
+    mkdir -p "${APP_ASSET_DIR}" /run/app /etc/app "${APP_WWW}"
 
 COPY --from=builder /out/relay       /usr/local/bin/${APP_BIN_NAME}
 COPY --from=builder /out/geoip.dat   /usr/local/share/app/geoip.dat
 COPY --from=builder /out/geosite.dat /usr/local/share/app/geosite.dat
 
-COPY config/config.json.template /usr/local/share/app/config.json.template
-COPY docker/entrypoint.sh        /usr/local/bin/entrypoint.sh
-COPY scripts/share-link.sh       /usr/local/bin/share-link.sh
+COPY config/config.json.template     /usr/local/share/app/config.json.template
+COPY docker/Caddyfile.platform       /usr/local/share/app/Caddyfile.platform
+COPY docker/entrypoint.sh            /usr/local/bin/entrypoint.sh
+COPY scripts/share-link.sh           /usr/local/bin/share-link.sh
+# 静态站点直接打进镜像：托管平台上没有 compose 那样的宿主机挂载，
+# 若不打包进去，入口层就没有内容可服务（此前正是这个原因导致探测者看到 404）。
+COPY web/                            /srv/www/
 
 RUN set -eux; \
     chmod 0755 "${APP_BIN}" "${APP_ENTRYPOINT}" "${APP_SHARE_BIN}"; \
@@ -71,8 +80,15 @@ RUN set -eux; \
     # 对应名称——DEBRAND=false 时二进制保留上游名，不能用中性名去匹配。
     # 断言的是命令输出（纯文本），不是二进制本身。输出只进构建日志，不进镜像。
     if [ "${DEBRAND}" = "true" ]; then smoke_name='Relay'; else smoke_name='V2Ray'; fi; \
-    ( "${APP_BIN}" -version || "${APP_BIN}" version ) 2>&1 | grep -q "${smoke_name}"
+    ( "${APP_BIN}" -version || "${APP_BIN}" version ) 2>&1 | grep -q "${smoke_name}"; \
+    # 入口层冒烟测试：Caddyfile 必须在构建期就通过校验，避免部署后才发现写错。
+    # 用的是占位变量的一次性取值，与运行期注入无关。
+    APP_EDGE_PORT=8080 APP_WS_PATH=/vless-ws APP_UPSTREAM=127.0.0.1:10000 APP_WWW="${APP_WWW}" \
+        "${APP_EDGE_BIN}" validate --config "${APP_EDGE_CONF}" --adapter caddyfile; \
+    # 静态站点必须真的进了镜像。
+    test -s "${APP_WWW}/index.html"
 
+# 未启用入口层时后端直接监听这个端口；启用时它由入口层接管。
 EXPOSE 10000/tcp
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
