@@ -40,7 +40,8 @@
 │   └── config.json.template    配置模板，占位符由入口脚本替换
 ├── docker/
 │   ├── entrypoint.sh           渲染配置 + 校验环境变量 + 启动前生成分享链接
-│   └── extract-artifacts.sh    在 builder 阶段定位并抽出发行产物
+│   ├── extract-artifacts.sh    在 builder 阶段定位并抽出发行产物
+│   └── debrand.sh              构建期对二进制做等长品牌字符串替换
 └── scripts/
     └── share-link.sh           生成 VLESS 分享链接；也会装进镜像供容器内调用
 ```
@@ -58,9 +59,38 @@
 | 配置 `tag` | `ws-in` / `direct` / `drop`，不再有上游命名 |
 | 变量前缀 | 全部 `APP_*` |
 | **进程环境变量** | **`V2RAY_LOCATION_ASSET` 无法去掉**——它由二进制自身读取，用来定位 `geoip.dat`/`geosite.dat`，只能显式 export |
-| **二进制的内部字符串** | **未改动**。改二进制内容既超范围也需要重新签名，本方案不做 |
+| **二进制内的品牌字符串** | 由 `docker/debrand.sh` 在构建期做**等长替换**（见下节） |
 
-> 如需更彻底的去特征化（字符串混淆、UPX 等），请自行在 `Dockerfile` 的 runtime 阶段追加处理步骤。
+### 二进制内的品牌字符串替换
+
+上游二进制会自己打印品牌名（启动横幅、"… started" 日志行、`help` 输出），
+这些不受配置控制，只能改二进制。`docker/debrand.sh` 在 builder 阶段对它做替换，
+替换规则有两类：
+
+- **纯品牌字面量**：启动横幅 `V2Ray <版本>`、社区版说明、一行标语、`help` 里的
+  `V2Ray: ` 字段，以及编译进来的模块路径 `github.com/v2fly/v2ray-core/v5`；
+- **必须等长**：Go 的字符串常量与编译期写死的长度/索引元数据混排在一起，长度一变
+  那些元数据即失配（轻则输出错乱，重则启动即崩）。脚本对替换表逐条断言长度相等，
+  并在替换后复核文件字节数没变，否则构建失败。
+
+脚本只匹配**读取路径上的确切文本**，不做"凡含 `V2Ray` 就改"的全局替换，因此二进制里
+仍会保留一些上游标识：
+
+- proto 描述符里的大写类型名 `V2Ray.Core.*`（98 处）与小写包名 `v2ray.core.*`（569 处）：
+  会进 protobuf 注册表，改动收益低、风险高；
+- 裸 `v2ray` 子串（约 1.1 万处，绝大多数是 proto 包路径与编译期符号名）；
+- 少数编译期符号名（如 `startV2Ray`）；
+- 功能默认域名 `v2fly.org`（如 `udp:v2fly.org:6666`）——改动收益低，且不属于品牌输出。
+
+也就是说：**运行时可观察到的品牌输出已中性化，但静态扫描二进制仍能看到上游包名**，
+只靠 `strings` 扫描并不能做到"零命中"。
+
+脚本还会在替换后做自检：替换表里标记 `!` 的条目必须在二进制里找到（上游改了字符串
+就让构建失败，而不是静默漏掉）；替换后必须仍能执行 `version` 且输出里不再有品牌字样。
+构建期设 `--build-arg DEBRAND=false` 可整体跳过。
+
+> 如需更彻底的处理（字符串混淆、UPX 等），请在 `Dockerfile` 的 builder 阶段
+> 追加步骤，并保证替换后仍能通过 `version` 自检。
 
 ## 构建方式
 
@@ -135,6 +165,7 @@ docker compose exec app cat /run/app/config.json
 | --- | --- | --- |
 | `SRC_VERSION` | `v5.41.0` | 构建参数，指定上游官方镜像 tag |
 | `APP_BIN_NAME` | `relay` | 构建参数，容器内二进制名（即进程名） |
+| `DEBRAND` | `true` | 构建参数，是否对二进制内品牌字符串做等长替换（`false` 时保留上游品牌字样，仅供排查构建问题） |
 | `APP_IMAGE` / `APP_CONTAINER_NAME` / `EDGE_CONTAINER_NAME` | `relay` / `relay` / `front` | 镜像与容器命名 |
 | `APP_DOMAIN` | 空 | **必填**，对外域名；用于申请证书与生成链接。留空退化为只监听 80（无证书） |
 | `ACME_EMAIL` | 空 | Let's Encrypt 通知邮箱，可留空 |
@@ -206,6 +237,17 @@ curl -s -o /dev/null -w '%{http_code}\n' https://your.domain.com/nope
 - `APP_BLOCK_PRIVATE=true` 时，私网目标被丢弃，公网目标走 `direct`。
 - 所有环境变量校验分支均按预期拒绝非法输入并以非零码退出。
 
+去品牌替换（`docker/debrand.sh`）已用真实 `v5.41.0` 二进制实测（用 busybox 工具集模拟
+容器内的工具实现）：
+
+- 替换前后文件字节数完全一致（35 639 444 字节），对全量做逐字节比对后，**所有差异段
+  长度相等**，且没有任何差异段跨越 `NUL`；
+- `version` / `help` / `test` 三条路径的输出与退出码和原始二进制一致，横幅与标语已中性化；
+- 用替换后的二进制同时作服务端与客户端，VLESS + WS 端到端代理连通，日志里
+  `… started` 行显示为 `Relay <版本>`（原始二进制为 `V2Ray <版本>`）；
+- 必需项缺失、替换串长度不等、文件不存在三种情况均以非零码退出并给出原因；
+- 对已去品牌的二进制重复执行会明确报错（而不是静默通过）。
+
 改造为「Caddy 伪装层 + 去特征化命名」后，以下已用 dash 与 busybox `sh` 模拟容器环境回归通过：
 
 - 入口脚本语法、占位符全量替换、UUID 生成与复用；
@@ -213,4 +255,4 @@ curl -s -o /dev/null -w '%{http_code}\n' https://your.domain.com/nope
 - 分享链接的域名优先级 `APP_SHARE_HOST` → `APP_DOMAIN` → `APP_WS_HOST`；
 - 非法输入被拒绝，域名缺失时只警告不阻断启动。
 
-尚未实测（本机无 Docker）：`docker build` 全流程、Caddy 证书申请、以及真实的反代分流行为。
+尚未实测（本机无 Docker）：`docker build` 全流程（含 builder 阶段去品牌与 `grep` 冒烟测试）、Caddy 证书申请、以及真实的反代分流行为。

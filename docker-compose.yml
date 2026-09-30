@@ -14,6 +14,7 @@ services:
       args:
         SRC_VERSION: ${SRC_VERSION:-v5.41.0}
         APP_BIN_NAME: ${APP_BIN_NAME:-relay}
+        DEBRAND: ${DEBRAND:-true}
     image: ${APP_IMAGE:-relay}:${SRC_VERSION:-v5.41.0}
     container_name: ${APP_CONTAINER_NAME:-relay}
     restart: unless-stopped
