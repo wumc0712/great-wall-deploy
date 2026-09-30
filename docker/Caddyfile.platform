@@ -1,0 +1,69 @@
+# 内嵌入口层的配置（托管平台 / 单容器场景）。
+#
+# 与 caddy/Caddyfile 的区别：
+#   * 那份用于 compose 的 edge 容器，靠 Let's Encrypt 申请证书、对外监听 443；
+#   * 这份跑在同一容器内，**只监听平台给的明文端口**，TLS 由平台边缘终止
+#     （Railway 等 PaaS 会终止 TLS 并把明文请求转发到容器端口）。
+#
+# 伪装策略与 compose 版一致：只有「路径 + WS 升级头」同时匹配才转发给后端，
+# 其余请求一律返回 /srv/www 下的静态站点。
+#
+# 由入口脚本注入的变量：
+#   APP_EDGE_PORT  对外监听端口（平台注入的 PORT）
+#   APP_WS_PATH    WebSocket 路径，须与后端一致
+#   APP_UPSTREAM   后端地址，形如 127.0.0.1:10000
+#   APP_WWW        静态站点根目录
+
+{
+	# 不需要管理 API；关掉可少暴露一个入口。
+	admin off
+	# 不自行申请证书：证书由平台边缘负责，这里只服务明文 HTTP。
+	auto_https off
+}
+
+:{$APP_EDGE_PORT} {
+	encode zstd gzip
+
+	# --- WebSocket 入口：路径 + 升级头同时匹配才放行 -------------------------
+	# 普通 GET（含探测器的 GET）没有 Upgrade 头，会落到下面的静态页分支。
+	@ws {
+		path {$APP_WS_PATH}
+		header Connection *Upgrade*
+		header Upgrade *
+	}
+
+	handle @ws {
+		reverse_proxy {$APP_UPSTREAM}
+	}
+
+	# --- 伪装静态页：其余所有请求 -------------------------------------------
+	handle {
+		root * {$APP_WWW}
+		# 支持无扩展名访问（/about → about.html）。
+		try_files {path} {path}.html {path}/
+		file_server
+	}
+
+	# 错误也返回站点自己的页面，而不是 Caddy 的默认纯文本。只拦 404。
+	handle_errors {
+		@notfound expression {err.status_code} == 404
+		handle @notfound {
+			rewrite * /404.html
+			root * {$APP_WWW}
+			file_server
+		}
+	}
+
+	# 去指纹：去掉 Caddy 的 Server 头，补上静态站该有的安全头。
+	header {
+		-Server
+		-X-Powered-By
+		Referrer-Policy "strict-origin-when-cross-origin"
+		X-Content-Type-Options "nosniff"
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}
