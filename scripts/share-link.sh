@@ -50,10 +50,28 @@ if [ -z "$UUID" ] && [ -s "./data/uuid" ]; then
     UUID="$(tr -d ' \t\r\n' < ./data/uuid)"
 fi
 
-# 域名优先级：APP_SHARE_HOST → APP_DOMAIN（边缘证书域名）→ APP_WS_HOST。
+# 域名优先级：APP_SHARE_HOST → APP_DOMAIN（边缘证书域名）→ 平台注入的
+# RAILWAY_PUBLIC_DOMAIN → APP_WS_HOST。
 HOST="${APP_SHARE_HOST:-}"
 [ -n "$HOST" ] || HOST="${APP_DOMAIN:-}"
+[ -n "$HOST" ] || HOST="${RAILWAY_PUBLIC_DOMAIN:-}"
 [ -n "$HOST" ] || HOST="${APP_WS_HOST:-}"
+
+# 平台注入的值可能是 "https://host:port/path" 形态，这里规整成纯主机名。
+# 顺序要紧：先去 scheme，再去路径，最后去端口（IPv6 的 [..] 原样保留）。
+case "$HOST" in
+    *://*) HOST="${HOST#*://}" ;;
+esac
+case "$HOST" in
+    */*) HOST="${HOST%%/*}" ;;
+esac
+case "$HOST" in
+    *@*) HOST="${HOST#*@}" ;;
+esac
+case "$HOST" in
+    \[*\]*) ;;
+    *:*)    HOST="${HOST%%:*}" ;;
+esac
 
 PORT="${APP_SHARE_PORT:-443}"
 WS_PATH="${APP_WS_PATH:-/vless-ws}"
@@ -67,6 +85,27 @@ if [ -z "$UUID" ]; then
 fi
 if [ -z "$HOST" ]; then
     echo "错误：拿不到域名。请设置 APP_DOMAIN（或 APP_SHARE_HOST / APP_WS_HOST）。" >&2
+    exit 1
+fi
+# 域名会原样拼进分享链接，先挡掉含空格/引号/分号等会导致链接畸形或可用于注入的值。
+# 用 case 而非 grep：grep 逐行匹配，多行值只要有一行合法就会放过，case 则匹配整个串。
+host_bad() {
+    # 注意用 if，不要写 `[ -z "$1" ] && return 0`：条件为假时整条语句以非零码
+    # 结束，set -e 会直接把脚本终止。
+    if [ -z "$1" ]; then return 0; fi
+    if [ "${#1}" -gt 253 ]; then return 0; fi
+    case "$1" in
+        *[!A-Za-z0-9.-]*) return 0 ;;
+    esac
+    return 1
+}
+if host_bad "$HOST"; then
+    # 平台注入的值用户改不了，此时只是提示；显式配置的非法值直接失败。
+    if [ -n "${RAILWAY_PUBLIC_DOMAIN:-}" ] && [ "$HOST" = "${RAILWAY_PUBLIC_DOMAIN:-}" ]; then
+        echo "错误：RAILWAY_PUBLIC_DOMAIN 不是合法主机名，已忽略，请显式设置 APP_DOMAIN。" >&2
+    else
+        echo "错误：域名含有非法字符（只允许字母、数字、. 和 -）：$HOST" >&2
+    fi
     exit 1
 fi
 

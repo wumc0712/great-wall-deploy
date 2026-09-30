@@ -244,20 +244,71 @@ BUILT_VERSION="$(cat "$APP_VERSION_FILE" 2>/dev/null || echo '未知')"
 #   APP_DOMAIN=你的域名 sh /usr/local/bin/share-link.sh
 SHARE_LINK_BIN="${APP_SHARE_BIN:-/usr/local/bin/share-link.sh}"
 SHARE_LINK_FILE="${APP_SHARE_FILE:-$(dirname "$APP_UUID_FILE")/share-link.txt}"
-# 对外域名：APP_SHARE_HOST 优先，其次 APP_DOMAIN（边缘证书用的同一个域名），
-# 最后退回 APP_WS_HOST（它的语义是校验 Host 头，通常与对外域名一致）。
-APP_SHARE_HOST="${APP_SHARE_HOST:-${APP_DOMAIN:-}}"
-APP_SHARE_HOST="${APP_SHARE_HOST:-$APP_WS_HOST}"
+# 分享链接里的域名不是服务端运行的必要条件，因此**任何情况下都不该阻断启动**：
+# 用户显式配错了就报错退出（早失败早发现），平台注入的值不可控，非法时只警告忽略。
 APP_SHARE_PORT="${APP_SHARE_PORT:-443}"
 
+# 从形如 "https://host:port/path" 的值里取出主机名。平台注入的变量格式不完全可控，
+# 先做规整再校验。注意顺序：先去 scheme，再去路径，最后去端口（IPv6 的 [..] 保留）。
+sanitize_host() {
+    h="$1"
+    case "$h" in
+        *://*) h="${h#*://}" ;;
+    esac
+    case "$h" in
+        */*) h="${h%%/*}" ;;
+    esac
+    case "$h" in
+        *@*) h="${h#*@}" ;;
+    esac
+    case "$h" in
+        \[*\]*) ;;                    # [v6]:port —— 保留方括号内的内容
+        *:*)    h="${h%%:*}" ;;
+    esac
+    printf '%s' "$h"
+}
+
+is_valid_host() {
+    # 用 case 而不是 `grep -E '^[A-Za-z0-9.-]+$'`：grep 是逐行匹配的，
+    # 形如 "evil\ndomain.com" 的多行值只要有一行合法就会通过校验，
+    # 而 case 是对整个字符串做匹配，换行同样会被下面这条模式拒绝。
+    [ -n "$1" ] || return 1
+    # 长度上限：DNS 名最长 253 字符，挡掉明显异常的超长值。
+    [ "${#1}" -le 253 ] || return 1
+    case "$1" in
+        *[!A-Za-z0-9.-]*) return 1 ;;
+    esac
+    return 0
+}
+
+# 优先级：APP_SHARE_HOST → APP_DOMAIN（边缘证书用的域名）→ 平台注入的
+# RAILWAY_PUBLIC_DOMAIN → APP_WS_HOST（语义是校验 Host 头，通常与对外域名一致）。
+APP_SHARE_HOST="${APP_SHARE_HOST:-${APP_DOMAIN:-}}"
 if [ -n "$APP_SHARE_HOST" ]; then
-    if ! printf '%s' "$APP_SHARE_HOST" | grep -Eq '^[A-Za-z0-9.-]+$'; then
+    # 用户显式配置：非法就退出，避免带着坏配置继续跑。
+    if ! is_valid_host "$APP_SHARE_HOST"; then
         die "APP_DOMAIN / APP_SHARE_HOST 含有非法字符：$APP_SHARE_HOST"
     fi
 else
+    # 平台注入：属于便利功能，用户改不了这个值，因此非法时只警告并忽略，
+    # 绝不能因此让容器启动失败。
+    if [ -n "${RAILWAY_PUBLIC_DOMAIN:-}" ]; then
+        APP_SHARE_HOST="$(sanitize_host "$RAILWAY_PUBLIC_DOMAIN")"
+        if is_valid_host "$APP_SHARE_HOST"; then
+            log "采用平台注入的域名（RAILWAY_PUBLIC_DOMAIN）：$APP_SHARE_HOST"
+        else
+            log "警告：RAILWAY_PUBLIC_DOMAIN 不是合法主机名，已忽略：$RAILWAY_PUBLIC_DOMAIN"
+            APP_SHARE_HOST=""
+        fi
+    fi
+    # 最后的兜底：APP_WS_HOST（前面已单独校验过字符集）。
+    [ -n "$APP_SHARE_HOST" ] || APP_SHARE_HOST="${APP_WS_HOST:-}"
+fi
+
+if [ -z "$APP_SHARE_HOST" ]; then
     # 不阻断启动：域名是客户端侧的参数，服务端照样能跑起来。
     APP_SHARE_HOST="your.domain.com"
-    log "警告：APP_DOMAIN / APP_SHARE_HOST / APP_WS_HOST 均未设置，链接里的域名暂用占位符 $APP_SHARE_HOST"
+    log "警告：APP_DOMAIN / APP_SHARE_HOST / RAILWAY_PUBLIC_DOMAIN / APP_WS_HOST 均未设置，链接里的域名暂用占位符 $APP_SHARE_HOST"
 fi
 
 case "$APP_SHARE_PORT" in

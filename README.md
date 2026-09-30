@@ -173,14 +173,14 @@ docker compose exec app cat /run/app/config.json
 | `APP_BIN_NAME` | `relay` | 构建参数，容器内二进制名（即进程名） |
 | `DEBRAND` | `true` | 构建参数，是否对二进制内品牌字符串做等长替换（`false` 时保留上游品牌字样，仅供排查构建问题） |
 | `APP_IMAGE` / `APP_CONTAINER_NAME` / `EDGE_CONTAINER_NAME` | `relay` / `relay` / `front` | 镜像与容器命名 |
-| `APP_DOMAIN` | 空 | **必填**，对外域名；用于申请证书与生成链接。留空退化为只监听 80（无证书） |
+| `APP_DOMAIN` | 空 | 对外域名；用于申请证书与生成链接。留空退化为只监听 80（无证书）。托管平台上可留空——会自动采用平台注入的域名（见下） |
 | `ACME_EMAIL` | 空 | Let's Encrypt 通知邮箱，可留空 |
 | `APP_PORT` | `10000` | 容器内明文 WS 监听端口，**不映射到公网** |
 | `APP_WS_PATH` | `/vless-ws` | WS 路径，**建议改成不易猜测的长随机值** |
 | `APP_UUID` | 空 | 留空则首次启动生成并持久化到 `./data/uuid` |
 | `APP_EMAIL` | `app` | 日志中标识该客户端 |
 | `APP_WS_HOST` | 空 | 限定 `Host` 头，留空不校验；设为 `APP_DOMAIN` 可收紧 |
-| `APP_SHARE_HOST` | 空 | 分享链接里的域名，留空取 `APP_DOMAIN` |
+| `APP_SHARE_HOST` | 空 | 分享链接里的域名，留空依次取 `APP_DOMAIN` → 平台注入域名 → `APP_WS_HOST` |
 | `APP_SHARE_PORT` | `443` | 分享链接里的端口 |
 | `APP_LOG_LEVEL` | `warning` | `debug`/`info`/`warning`/`error`/`none` |
 | `APP_LOG_ACCESS` / `APP_LOG_ERROR` | 空 | 留空输出到容器 stdout/stderr |
@@ -192,6 +192,24 @@ docker compose exec app cat /run/app/config.json
 脚本会对 `APP_PORT`、`APP_WS_PATH`、`APP_UUID`、`APP_EMAIL`、`APP_LOG_LEVEL`、`APP_SNIFFING`、`APP_DOMAIN_STRATEGY`、`APP_BLOCK_PRIVATE`、`APP_WS_HOST`、`APP_CLI` 做校验，非法值会让容器直接以非零码退出并打印原因，而不是带着坏配置启动。其中 `APP_WS_PATH`、`APP_EMAIL`、`APP_WS_HOST` 只允许安全字符集，避免破坏生成的 JSON。
 
 > **从旧版本升级**：变量前缀已从 `V2RAY_*` 改为 `APP_*`，容器内路径也从 `/etc/v2ray` 改为 `/etc/app`。请按 `.env.example` 重命名你的 `.env`，并注意 UUID 文件位置变化——否则服务端会生成新 UUID，已下发的客户端配置全部失效。
+
+### 在托管平台上部署（如 Railway）
+
+在 Railway 这类平台上直接部署本仓库的 `Dockerfile` 时：
+
+- **域名无需手填**：平台会注入 `RAILWAY_PUBLIC_DOMAIN`，入口脚本会自动采用它来生成分享链接，
+  无需设置 `APP_DOMAIN`。解析顺序为 `APP_SHARE_HOST` → `APP_DOMAIN` → `RAILWAY_PUBLIC_DOMAIN` → `APP_WS_HOST`，
+  显式配置始终优先；平台值会被规整成纯主机名（去掉 `scheme://`、路径、端口），非法时只警告忽略、
+  **绝不影响容器启动**。
+- **端口**：平台通常通过 `PORT` 决定对外端口，而本方案默认监听 `APP_PORT`（10000）。
+  若平台要求监听指定端口，请显式设置 `APP_PORT`（或 `PORT`，见下方注意）。
+- **`docker-compose.yml` 里的 `edge`（Caddy）不会启动**：Railway 一个服务只暴露一个端口，
+  跑不了需要 80/443 的 Caddy。此时 **TLS 由平台边缘终止**，所以分享链接里端口用 `443` 是对的，
+  但 README 前文描述的「静态站点伪装」和「明文 WS 不暴露」在平台上**不生效**——
+  探测者看到的是后端行为。要保留那层伪装，需要在支持多端口/自带域名的 VPS 上用 compose 部署。
+
+> 注意：本仓库的入口脚本目前只识别平台注入的域名，**不识别平台的 `PORT` 变量**。
+> 若平台上容器因端口不匹配而健康检查失败，请显式设置 `APP_PORT`。
 
 ## v4 / v5 差异
 
@@ -263,7 +281,7 @@ curl -s -o /dev/null -w '%{http_code}\n' https://your.domain.com/nope
 
 - 入口脚本语法、占位符全量替换、UUID 生成与复用；
 - 渲染结果不含上游命名（`tag` 已中性化）；
-- 分享链接的域名优先级 `APP_SHARE_HOST` → `APP_DOMAIN` → `APP_WS_HOST`；
+- 分享链接的域名优先级 `APP_SHARE_HOST` → `APP_DOMAIN` → 平台注入域名（`RAILWAY_PUBLIC_DOMAIN`）→ `APP_WS_HOST`；
 - 非法输入被拒绝，域名缺失时只警告不阻断启动。
 
 尚未实测（本机无 Docker）：`docker build` 全流程（含 builder 阶段去品牌与 `grep` 冒烟测试）、Caddy 证书申请、以及真实的反代分流行为。
