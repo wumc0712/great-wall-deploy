@@ -15,6 +15,12 @@ FROM v2fly/v2fly-core:${SRC_VERSION} AS builder
 # 设为 false 可跳过二进制去品牌替换（排查构建问题时用）。
 ARG DEBRAND=true
 
+# 去品牌脚本要求 GNU sed：alpine 自带的 busybox sed（1.37）在 35 MB 二进制上
+# 会静默漏替换且文件大小不变（实测，见 docker/debrand.sh 顶部注释），
+# 因此这里显式安装 GNU sed。只在 builder 层，运行层镜像不含它。
+RUN set -eux; \
+    if [ "${DEBRAND}" = "true" ]; then apk add --no-cache sed; fi
+
 COPY docker/extract-artifacts.sh docker/debrand.sh /tmp/
 
 # 先抽取资源，再对二进制做等长替换。两步都在 builder 层，产物只有 /out/relay
