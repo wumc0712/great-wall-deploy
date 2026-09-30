@@ -190,7 +190,7 @@ docker compose exec app cat /run/app/config.json
 | `APP_BLOCK_PRIVATE` | `true` | 丢弃目标为私网地址的出站流量，避免被当作内网跳板 |
 | `APP_CLI` | `auto` | 主版本探测；仅在自动识别异常时才需强制 `v4`/`v5` |
 | `APP_EDGE` | `auto` | 是否启用容器内嵌 Caddy 入口层（静态站点伪装 + 端口适配）。`auto` 时检测到平台注入端口即启用；compose 部署应保持 `false` |
-| `APP_EDGE_PORT` | 空 | 入口层对外监听端口，留空取平台注入的 `PORT`。必须与 `APP_PORT` 不同 |
+| `APP_EDGE_PORT` | 空 | 入口层对外监听端口，留空取平台注入的 `PORT`。与 `APP_PORT` 撞车时后端会自动挪到相邻端口 |
 
 脚本会对 `APP_PORT`、`APP_WS_PATH`、`APP_UUID`、`APP_EMAIL`、`APP_LOG_LEVEL`、`APP_SNIFFING`、`APP_DOMAIN_STRATEGY`、`APP_BLOCK_PRIVATE`、`APP_WS_HOST`、`APP_CLI` 做校验，非法值会让容器直接以非零码退出并打印原因，而不是带着坏配置启动。其中 `APP_WS_PATH`、`APP_EMAIL`、`APP_WS_HOST` 只允许安全字符集，避免破坏生成的 JSON。
 
@@ -210,17 +210,19 @@ docker compose exec app cat /run/app/config.json
   入口脚本检测到平台端口时**自动启用**（可用 `APP_EDGE=false` 关闭）。
 - **TLS 由平台边缘终止**：所以分享链接里端口用 `443` 是对的，容器内只跑明文 HTTP。
 - **端口**：入口层监听平台注入的 `PORT`，后端自动退到容器内部另一个端口（默认 `10000`，只绑回环）。
-  两者必须不同，冲突时会明确报错而不是静默降级。
+  若两者撞车（平台常把 `PORT` 设成与容器 `EXPOSE` 相同的值，Railway 就是如此），
+  后端会**自动挪到相邻端口**并打印日志——不会因为一个端口号没对齐就让容器起不来。
 
 > 只有在「平台既不给 `PORT`、也不给 `APP_EDGE_PORT`」的情况下入口层才不启用。此时可显式设置
-> `APP_EDGE_PORT`（或 `APP_EDGE=true` 强制启用）；`APP_EDGE=true` 但拿不到端口会直接启动失败。
+> `APP_EDGE_PORT`（或 `APP_EDGE=true` 强制启用）；`APP_EDGE=true` 但拿不到端口会直接启动失败
+> （这种情况属于用户显式要求，报错比静默降级更清楚）。
 
 ### 端口分工
 
 | 场景 | 对外端口 | 后端监听 | 静态站点伪装 |
 | --- | --- | --- | --- |
 | compose（VPS） | `edge` 容器的 80/443 | `app` 容器 `APP_PORT`（内网） | 由 `edge` 的 Caddy 提供 |
-| 托管平台（Railway 等） | 平台注入的 `PORT` | 容器内回环 `APP_PORT`（公网扫不到） | 由**容器内嵌**的 Caddy 提供 |
+| 托管平台（Railway 等） | 平台注入的 `PORT` | 容器内回环 `APP_PORT`（撞车时自动顺延，公网扫不到） | 由**容器内嵌**的 Caddy 提供 |
 | 直接 `docker run`（未给平台端口） | `APP_PORT` | 同上 | 无（可用 `APP_EDGE_PORT` 显式开启） |
 
 ## v4 / v5 差异
@@ -295,10 +297,13 @@ curl -s -o /dev/null -w '%{http_code}\n' https://your.domain.com/nope
 - 启用入口层时：`/`、`/about`、`/assets/style.css` 等返回 **200 静态站点**；
   `/vless-ws` 无升级头返回站点自己的 **404 页**（HTML），带升级头才转发后端；
   经入口层完成 VLESS + WS 端到端代理，且后端此时只监听 `127.0.0.1`；
+- **端口撞车会自动错开**：实测 `PORT=10000`（与容器 `EXPOSE`/后端默认端口相同，Railway 就是这种情况）
+  时，后端自动挪到 `10001`，入口层仍监听 `10000`；`config.json` 里的后端端口与入口层反代目标始终一致；
 - 不启用时（`APP_EDGE=false`）：行为与改造**前完全一致**，无回归；
 - 任一进程退出（如后端崩溃）容器会整体停止，不再出现"一个死了另一个还在"的半死状态；
   收到 `TERM` 时两个子进程都被清理，无残留进程；
-- `APP_EDGE=true` 但拿不到端口、或入口层端口与 `APP_PORT` 相同时，启动即报错而不是静默降级。
+- 仅「`APP_EDGE=true` 但拿不到端口」「`APP_EDGE` 值非法」「`APP_EDGE_PORT` 非数字/超范围」这几种
+  属于用户显式配错的情况才报错退出；端口撞车**不在**其中。
 
 改造为「Caddy 伪装层 + 去特征化命名」后，以下已用 dash 与 busybox `sh` 模拟容器环境回归通过：
 

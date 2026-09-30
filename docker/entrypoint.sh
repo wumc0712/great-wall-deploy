@@ -94,7 +94,7 @@ esac
 APP_EDGE_PORT="${APP_EDGE_PORT:-${PORT:-}}"
 if [ "$APP_EDGE_ON" = "true" ]; then
     if [ -z "$APP_EDGE_PORT" ]; then
-        # 明确要求启用却拿不到对外端口：与其静默降级（正是要修的 bug），不如直接报错。
+        # 明确要求启用却拿不到对外端口：静默降级会让人以为伪装生效了，故直接报错。
         die "APP_EDGE=true 但拿不到对外端口：请设置 APP_EDGE_PORT（或让平台注入 PORT）"
     fi
     case "$APP_EDGE_PORT" in
@@ -102,8 +102,19 @@ if [ "$APP_EDGE_ON" = "true" ]; then
     esac
     [ "$APP_EDGE_PORT" -ge 1 ] && [ "$APP_EDGE_PORT" -le 65535 ] \
         || die "APP_EDGE_PORT 超出 1-65535：$APP_EDGE_PORT"
+
+    # 端口撞车是**常见情况而非配置错误**：平台常把 PORT 设成与容器 EXPOSE 相同的值
+    # （Railway 就是如此，其 EXPOSE 为 10000），正好等于后端默认端口。
+    # 这里绝不能 die——那会让容器启动即退出，对外表现为平台层的 502，
+    # 把"一个端口号没对齐"升级成"整个服务不可用"。改为把后端挪到相邻端口。
     if [ "$APP_EDGE_PORT" = "$APP_PORT" ]; then
-        die "端口冲突：APP_PORT 与 APP_EDGE_PORT 同为 $APP_PORT。入口层与后端必须用不同端口，请显式设置其中一个"
+        if [ "$APP_PORT" -lt 65535 ]; then
+            APP_PORT_MOVED=$(( APP_PORT + 1 ))
+        else
+            APP_PORT_MOVED=$(( APP_PORT - 1 ))
+        fi
+        log "端口冲突：入口层端口与 APP_PORT 同为 $APP_PORT，后端自动改用 $APP_PORT_MOVED（如需固定请显式设置 APP_PORT）"
+        APP_PORT="$APP_PORT_MOVED"
     fi
 fi
 
