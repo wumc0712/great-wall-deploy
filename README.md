@@ -1,4 +1,4 @@
-# v2ray-core-deploy
+# great-wall-deploy
 
 [v2ray-core](https://github.com/v2fly/v2ray-core) 的服务端 Docker 方案，协议为 **VLESS + WebSocket**，带一层**静态站点伪装**与**去特征化命名**。
 
